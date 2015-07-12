@@ -1,0 +1,110 @@
+Todo:
+
+* EMIT is spitting out garbage characters, probably due to endian problems.
+
+* save the memory image back to disc on exit, or get mmap to write back to disc...
+  save sp, rp, ip, etc.
+
+* ORIGIN at one meg isnt going to work... NetBSD is mapping us starting at 128 megs in.
+  or it might work. the mmap() didnt fail... if ORIGIN changes, it has to be changed
+  three places... nf.c, forth.c, and forth.dict. 
+
+* comment all of the routines in forth.dict with descs from the photocopies...
+
+* we have some rogue primitives whose forth word names i dont know so i cant
+  attach them. not known if they are needed or not...
+
+* make storing comments and whitespace an option, to avoid .mem bloat for small
+  systems. add an endian flag to nf.c, so that processors can generate .mem's
+  for processors of opposite endianess. create a way to override word size
+  for similiar reason. whitespace should encode information about the line
+  number, and number (count) of spaces after the newline, rather then trying
+  to hold a litteral string.
+
+* write forth definitions for:
+  ENCLOSE
+  2@ 2! D+ D-
+  (;CODE) is broken
+  DOES> <BUILDS TO
+  DISASSEMBLE
+
+* would be cool if nf.c could impilicitly add a 'LIT' before numeric values.
+
+* high water marking: DP should evaluate to a routine that checks DAMLEVEL. On
+  attempt to store a value in DP that is larger then DAMLEVEL, a memory region
+  atleast as large as the difference will be silently allocated. DP's new
+  definition will have to include a reference to a new primitive to do the
+  actually mmap'ing.
+
+* #ifdef's for the MMU stuff and Unix stuff. Specificly, we should be able
+  to set the ORIGIN to something, then just address that memory, and
+  assume it's already set up for us. A serial downloader (S-record? Hex?)
+  to bootstrap this memory region with would be useful as well.
+
+Changes from "C-CODED FORTH":
+
+* Forth's VM shares the memory map with the underlieing C process, rather then
+  running "in a box". Raw pointers are used instead of array indices, saving
+  several additions per word executed. The Forth VM is a much more low-level
+  creature, now. Bad Forth code can cause the interpreter to core dump, but
+  can also be linked to another C program and access it's datastructures,
+  or mmap in a shared data segment and corroborate. It is also possible
+  to use a Forth-based assembler for the current system, and create more
+  primitives from within the system. This can add support for Unix 
+  system calls, implement device I/O in small systems, add additional
+  interpeters besides the standard Forth colon/simicolon one, etc.
+
+* Forth uses the machine's word-size as it's wordsize, rather then always
+  faking it to be 16 bits. This allows Forth programs and datastructures
+  to exceed 64kilobytes of RAM for computers that address more then 64k
+  of RAM. Forth should still run on 16 bit computers as well. In fact,
+  this version is ideal for 6502 and 6800 based controllers that,
+  unlike 8080, 8085, Z80 based controllers, need to do memory mapped
+  I/O. Byte addressing now actually works, rather then using a whole
+  word to store a byte, and strings are now stored as expected.
+
+* More of Forth is written in itself. This keeps the system
+  extensible. Forth is also ment to be understandable from within itself.
+
+* nf.c and forth.dict are primarily Alan's code and the FIG Forth code
+  respectively. I hacked on each of them, but these were provided for
+  me. forth.c is nearly a complete rewrite, however. forth.lex was
+  also slightly hacked.
+
+* All bugs are of course mine. Additionally, support for block based
+  I/O has been removed. 
+
+Changes from Standard Fig Forth 79:
+
+* Block I/O is gone, hopefully to be replaced with something else.
+
+* Startup might not be exactly the same but should be close.
+
+* TIB has it's own little buffer area that doesn't move around.
+
+Manifest:
+
+Makefile           - type "make" to build the system. "make" uses this file
+README             - you're reading it
+forth.c            - source to the Forth language executable
+nf.c               - program to compile Forth system library before Forth is up
+                     and running - this bootstraps the system
+forth.dict         - textual (Forth-ish) system dictionary, used in bootstrapping
+forth.lex          - nf.c links to this - language definition for forth.dict used in bootstrapping
+forth.lex.h        - nf.c and forth.lex include this - defines token values
+orig/              - Alan Pratt's version, which I started with
+
+Thanks:
+
+* Alan Pratt, for the source code and inspiration. Dispite the short-comings
+  of C-CODED FORTH, it was almost a true Forth system, missing only 
+  support for assembling your own primitives. This is much much closer
+  to a real Forth system then anything else written in any language
+  except assembly, and I applaud Alan for that. Other systems try to
+  look like Forth, but in truth share none of it's design or features.
+
+* Larry Wall, for showing a whole generation of hackers that computers
+  are fun, and that it's OK to get under the hood and muck about with 
+  things.
+
+* Charles Moore, for Forth itself.

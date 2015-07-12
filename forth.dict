@@ -1,0 +1,1260 @@
+( this file contains the Forth core, written in Forth, with slight modification to make it
+  digestable by nf.c, the program which bootstraps the Forth interpreter. this code is based
+  heavily on the Fig-Forth 79 standard code. )
+PRIM (COMMENT)          67      ( -- < perserve comments from the source code in the compiled defs - must be first prim > )
+( these numbers gets changed to real addresses when the dictionary image is loaded, and
+  thus dont have any real meaning. the only requirement is that each one is unique. if it isnt
+  unique, then the other primitives with the same number had better be aliases cuz they are all
+  gunna do the same thing. )
+PRIM DOCOL		1	( goes into CF of : definitions )
+PRIM DOCON		2	( goes into CF of constants )
+PRIM DOVAR		3	( goes into CF of variables )
+PRIM DOUSE		4	( goes into CF of user variables )
+PRIM EXECUTE		20	( cfa -- <execute word> )
+PRIM LIT		26	( push the next value to the stack )
+PRIM BRANCH		13	( branch by offset in next word )
+PRIM 0BRANCH		51	( branch if zero by offset in next word )
+PRIM 1BRANCH		71	( branch if true by offset in next word )
+PRIM (LOOP)		33	( end of a <DO> )
+PRIM (+LOOP)		34	( inc -- <end of a <DO> w/increment != 1 > )
+PRIM (DO)		32	( limit init -- <begin a DO loop> )
+PRIM I			23	( get loop index <R> )
+PRIM DIGIT		55	( c -- DIGIT 1 | 0 <convert digit> )
+( prim leftparenFINDrightparen	NoLongerPrim	 s -- s 0 | s NFA 1 <find word s> )
+PRIM EXPECT             11      ( inbuf maxount --   )
+PRIM TYPE               10      ( outbufp len -- )
+CONST ?TERMINAL		0       ( see if op. interrupted <like w/^C> )
+PRIM CMOVE		15	( src dest count -- <move words> )
+( PRIM U*			57	( unsigned multiply )
+( PRIM U/			56	( unsigned divide )
+PRIM *                  57      ( multiply )
+PRIM /                  56      ( divide )
+PRIM AND		12	( a b -- a&b )
+PRIM OR			29	( a b -- a|b )
+PRIM XOR		50	( a b -- a%b )
+PRIM SP@		42	( -- sp )
+PRIM SP!		43	( -- <store empty value to sp> )
+PRIM RP@		39	( -- rp )
+PRIM RP!		40	( -- <store empty value to rp> )
+PRIM ;S			41	( -- <pop r stack <end colon def'n>> )
+PRIM LEAVE		24	( -- <set index = limit for a loop> )
+PRIM >R			49	( a -- <push a to r stack> )
+PRIM R>			38	( -- a <pop a from r stack )
+PRIM 0=			52	( a -- !a <logical not> )
+PRIM 0<			53	( a -- a<0 )
+PRIM +			64	( a b -- a+b )
+PRIM MINUS		27	( a -- -a )
+PRIM DMINUS		59	( ahi alo -- <-a>hi <-a>lo )
+PRIM OVER		30	( a b -- a b a )
+PRIM DROP		17	( a -- )
+PRIM SWAP		46	( a b -- b a )
+PRIM DUP		18	( a -- a a )
+PRIM 2DUP		47	( a b -- a b a b )
+PRIM +!			36	( val addr -- < *addr += val > )
+PRIM TOGGLE		48	( addr mask -- <*addr %= mask> )
+PRIM @			21	( addr -- *addr )
+PRIM C@			14	( addr -- *addr )
+PRIM !			44	( val addr -- <*addr = val> )
+PRIM C!			16	( val addr -- <*addr = val> )
+PRIM -			66	( a b -- a-b )
+PRIM =			19	( a b -- a==b )
+PRIM !=			28	( a b -- a!=b )
+PRIM <			25	( a b -- a<b )
+PRIM ROT		68	( a b c -- c a b )
+PRIM R			37	( same as I, but must be a primitive )
+PRIM (BYE)		60	( executes exit <pop[]>; )
+PRIM (SAVE)		65	( Save current environment )
+PRIM ++                 62      ( addr -- < inc value at memory location > )
+PRIM --                 63      ( addr -- < dec value at memory location > )
+PRIM PICK               69      ( pos -- val < copy a value from position pos on the stack to the top > )
+PRIM IP@                70      ( -- ip < put the virtual machine's address on the computation stack > )
+PRIM (DUMP)             72      ( -- < dump a virtual machine stack backtrace to stdout and bail quickly > )
+
+( end of primitives )
+
+CONST 0 0
+CONST 1 1
+CONST 2 2
+CONST 3 3
+CONST -1 -1
+CONST BL 32		( A SPACE, OR BLANK )
+CONST C/L 80            ( was 64, bleah )
+
+( ip goes in mem[0] )
+( csp goes in mem[1] )
+( rsp goes in mem[2] )
+USER DP		3       ( data pointer - points to the end of used memory, where next definition goes )
+USER S0		4       ( initial value of stack pointer, used to reset virtual machine after an error/abort )
+USER R0		5       ( initial value of return stack pointer, similiar to S0 )
+USER TIB	6       ( text in buffer address )
+USER WORDSIZEB  7       ( size of the machine word on this system )
+USER WIDTH	27      
+USER WARNING	28
+USER FENCE	29      ( FORGET word deletes everything after FENCE.. this is updated to commit/uncommit stuff )
+USER VOC-LINK	31      ( address of a field in the definition of most recently created vocabulary.. uh, ok )
+USER BLK	32      ( current bloc number - used during interpretation - 0 means terminal )
+USER IN		33      ( byte offset within current input text buffer - terminal or disc. WORD uses and updates this )
+USER OUT	36      ( byte offset in the output text buffer. EMIT uses and updates this )
+USER CONTEXT	39      ( pointer to the vocabulary within which dictionary search will first begin )
+USER CURRENT	40      ( pointer to the vocabulary in which new definitions are to be added  - LATEST fetches this )
+USER STATE	41      ( 0 means system is in interpretive/executing state; non-zero means compiling )
+USER BASE	42      ( current number based used for input and output numeric conversions )
+USER DPL	43      ( number of digets to the right of the decimal point on double int input )
+USER FLD	44      ( field width for formatted number output )
+USER CSP	45      ( temporarily stored data stack pointer for compilation error checking )
+USER HLD	47      ( address of the latest character of text during number output conversion )
+( there is no LIMIT word, because this system has no predefined limit to memory growth )
+
+
+( the running virtual machine sets the user variable that tells us the word size...
+  this doesnt do nf.c any good when its building the memory image, though )
+: WORDSIZE WORDSIZEB @ ;
+
+( align an address to a word boundry - this is a local addition )
+: ALIGN                 ( addr -- addr-masked )
+  WORDSIZE LIT 1 -      ( 3/7 addr -- )
+  +                     ( addr -- )
+  WORDSIZE LIT 1 -      ( 3/7 addr -- )
+  -1                    ( -1 3/7 addr -- )
+  SWAP -                ( 0b11..11000 addr -- )
+  AND                   ( addr-masked -- )
+;
+
+( allot - allocate n words of storage on the end of memory - use after creating a word header
+  to add some room to its parameter field area )
+: ALLOT
+  WORDSIZE * DP @ + ALIGN DP !
+;
+
+( callot - like allot, except allocates characters )
+: CALLOT
+  DP @ + DP !
+;
+
+( emit - print out a single character )
+VAR EMITCHAR 0
+: EMIT
+  ( we used to just fetch the address of the datum on the stack, but we needed to nail down the location to a byte )
+  EMITCHAR C!       ( gotta deal with bytes so that endianess doesnt make it ambigious )
+  EMITCHAR          ( address of the string to print )
+  LIT 1             ( length of the string to print )
+  TYPE              ( primitive - takes len and address )
+  LIT 1 OUT +!      ( keep track of which column we think were in )
+  DROP              ( get rid of the character that was passed in to us )
+;
+
+: D+
+  DROP SWAP DROP + 0 SWAP
+;
+
+: D-
+  DROP SWAP DROP - 0 SWAP
+;
+
+: CR
+  LIT 13 EMIT
+  LIT 10 EMIT
+  0 OUT ! ;
+
+: NOP ;	( DO-NOTHING )
+
+: +ORIGIN LIT 0x0100000 + ;	( add origin of system; in this case, 1 meg )
+
+: 1+
+  1 + ;
+
+: 2+
+  2 + ;
+
+: 1-
+  1 - ;
+
+( these are primitives now
+: ++		 addr -- <increments val at addr> 
+  1 SWAP +! ;	 my own extension - my as in Allen's
+: --		 addr -- <decrements val at addr> 
+  -1 SWAP +! ;	 my own extension 
+)
+
+: HERE		( -- DP )
+  DP @ ;
+
+: ,		( V -- <PLACES V AT DP AND INCREMENTS DP> )
+  HERE !
+  LIT 1 ALLOT 
+;
+
+: C,		( C -- <COMPILE A CHARACTER. SAME AS , WHEN WORDSIZE=1> )
+  HERE C!
+  LIT 1 CALLOT 
+;
+
+( 
+: U<		( THIS IS TRICKY. 
+	2DUP XOR 0<	( SIGNS DIFFERENT? 
+	0BRANCH U1	( NO: GO TO U1 
+	DROP 0< 0=	( YES; ANSWER IS [SECOND > 0] 
+	BRANCH U2	( SKIP TO U2 <END OF WORD> 
+LABEL U1
+	- 0<	( SIGNS ARE THE SAME. JUST SUBTRACT
+		  AND TEST NORMALLY 
+LABEL U2
+	;
+)
+
+: >		( CHEAP TRICK )
+  SWAP < ;
+
+: <>		( NOT-EQUAL )
+  != ;
+
+: SPACE		( EMIT A SPACE )
+  BL EMIT
+;
+
+: -DUP		( V -- V | V V <DUPLICATE IF V != 0> )
+  DUP
+  0BRANCH DDUP1	( SKIP TO END IF IT WAS ZERO )
+  DUP
+LABEL DDUP1
+;
+
+: TRAVERSE      ( ADDY DIR -- OADDY )
+                ( DIR : 1=NFA->LFA, -1=LFA->NFA )
+           SWAP LIT 1 <> 0BRANCH T1
+           LFA->NFA BRANCH T2
+  LABEL T1 NFA->LFA
+  LABEL T2
+;
+
+  ( XXX looks like LATEST is busted... two @'s is one too many )
+
+: LATEST		( NFA OF LAST WORD DEFINED )
+  CURRENT @ @ ;
+
+: PFA->LFA		( GO FROM PFA TO LFA )
+  WORDSIZE - WORDSIZE - ;
+
+: PFA->CFA		( GO FROM PFA TO CFA )
+  WORDSIZE - ;
+
+: PFA->NFA		( GO FROM PFA TO NFA )
+  WORDSIZE - WORDSIZE -	( NOW AT LFA )
+  -1 TRAVERSE ;
+
+: NFA->PFA		( GO FROM NFA TO PFA )
+  WORDSIZE LIT 6 * + ;
+;
+
+( sdw... local definitions.. we use a fixed length name field )
+: NFA->LFA     LIT 4 WORDSIZE * + ;
+: LFA->NFA     LIT 4 WORDSIZE * - ;
+: NFA->CFA     LIT 5 WORDSIZE * + ;
+
+: !CSP			( SAVE CSP AT USER VAR CSP )
+  SP@ CSP ! ;
+
+: ERROR			( N -- <ISSUE ERROR #N> )
+  WARNING @ 0<		( WARNING < 0 MEANS <ABORT> )
+  0BRANCH E1
+  (ABORT)		( IF )
+LABEL E1
+  HERE COUNT TYPE (.") "?"	( THEN )
+  MESSAGE
+  SP!			( EMPTY THE STACK )
+  ( BLK @ -DUP		 /* IF LOADING, STORE IN & BLK  */
+  0BRANCH E2
+  ERRBLK ! IN @ ERRIN !	/* IF */
+LABEL E2 
+  )
+  QUIT			( /* THEN */ )
+;
+
+: ?ERROR		( F N -- <IF F, DO ERROR #N> )
+  SWAP
+  0BRANCH QERR1
+  ERROR			( IF <YOU CAN'T RETURN FROM ERROR> )
+LABEL QERR1
+  DROP			( THEN )
+;
+
+: ?COMP			( GIVE ERR#17 IF NOT COMPILING )
+  STATE @ 0= LIT 17 ?ERROR
+;
+
+: ?EXEC			( GIVE ERR#18 IF NOT EXECUTING )
+  STATE @ LIT 18 ?ERROR
+;
+
+: ?PAIRS		( GIVE ERR#19 IF PAIRS DON'T MATCH )
+  - LIT 19 ?ERROR
+;
+
+: ?CSP			( GIVE ERR#20 IF CSP & SP DON'T MATCH )
+  SP@ CSP @ - LIT 20 ?ERROR
+;
+
+( compile the cfa of the next word to dict )
+( this word is concerned with the next word that appears after it in the 
+  definition of the word that called this one. we can easily find the
+  cfa of that word by looking at our return stack - the address we return
+  to contains the cfa of the next word. i guess that would make it a
+  code-field-address-address. we compile this address into whichever
+  word is currently being defined, then return to the address after the 
+  one that we were going to. )
+: COMPILE		
+  ?COMP
+  R> DUP		( GET OUR RETURN ADDRESS )
+  WORDSIZE + >R		( SKIP NEXT; ORIG. ADDR STILL ON TOS )
+  @ ,
+;
+
+: [			( BEGIN EXECUTING )
+  0 STATE !
+;*                      ( ;* is equivilent to ; IMMEDIATE )
+
+: ]			( END EXECUTING )
+  LIT 0xC0 STATE !
+;*
+
+: SMUDGE		( TOGGLE COMPLETION BIT OF LATEST WORD )
+  LATEST		( WHEN THIS BIT=1, WORD CAN'T BE FOUND )
+  LIT 0x20 TOGGLE
+;
+
+: :
+			( DEFINE A WORD )
+  ?EXEC
+  !CSP
+  CURRENT @ CONTEXT !
+  CREATE ]		( MAKE THE WORD HEADER AND BEGIN COMPILING )
+  (;CODE) DOCOL
+;*
+
+: ;			( END A DEFINITION )
+  ?CSP			( CHECK THAT WE'RE DONE )
+  COMPILE ;S		( PLACE ;S AT THE END )
+  SMUDGE [		( MAKE THE WORD FINDABLE AND BEGIN INTERPRETING )
+;*
+
+: CONSTANT
+  CREATE SMUDGE ,
+  (;CODE) DOCON
+;
+
+: VARIABLE
+  CONSTANT
+  (;CODE) DOVAR
+;
+
+: USER
+  CONSTANT
+  (;CODE) DOUSE
+;
+
+: HEX			( GO TO HEXADECIMAL BASE )
+  LIT 0x10 BASE ! ;
+
+: DECIMAL		( GO TO DECIMAL BASE )
+  LIT 0x0A BASE !
+;
+
+: ;CODE				( unused without an assembler )
+  ?CSP COMPILE (;CODE) [ NOP	( "ASSEMBLER" might go where nop is )
+;*
+
+: (;CODE)			( differs from the normal def'n )
+  R> @ @ LATEST NFA->PFA PFA->CFA !
+;
+
+: COUNT			( ADDR -- ADDR+1 COUNT )
+  DUP WORDSIZE + SWAP @ ( CONVERTS THE <STRING> ADDR TO A FORM SUITABLE
+			  FOR "TYPE" )
+;
+
+: -TRAILING		( addr count -- addr count <count adjusted to
+			  exclude trailing blanks> )
+  DUP 0 (DO)		( DO )
+LABEL TRAIL1
+    OVER OVER + 1 - C@ BL -
+    0BRANCH TRAIL2
+    LEAVE BRANCH TRAIL3	( IF )
+LABEL TRAIL2
+    1 -			( ELSE )
+LABEL TRAIL3
+  (LOOP) TRAIL1		( THEN LOOP )
+;
+
+( runtime procedure compiled by ." to type an in-line text string to the terminal. )
+: (.")			( print a compiled string )
+  R                     ( copy IP from the return stack, which points to the beginning of the
+                          inline text string. )
+  COUNT                 ( at that address, pick out the length and string address. )
+  DUP                   ( add length, align to word boundry, plus one word, all back onto the return address. )
+  ALIGN
+  WORDSIZE +            ( length/wordsize rounded up is how many words the string takes, plus one word )
+  R> + >R               ( to account for the length field. )
+  TYPE                  ( call the TYPE primitive to output the string. )
+;
+
+: ."			( COMPILE A STRING IF COMPILING,
+			  OR PRINT A STRING IF INTERPRETING )
+  LIT '"'
+  STATE @
+  0BRANCH QUOTE1
+  COMPILE (.") WORD HERE C@ 1+ ALLOT	( IF )
+  BRANCH QUOTE2
+LABEL QUOTE1
+  WORD HERE COUNT TYPE			( ELSE )
+LABEL QUOTE2
+;*					( THEN )
+
+( query inputs 80 characters, or untill a CR, from the terminal and places the text
+  in the terminal input buffer, ie tib )
+: QUERY
+  TIB @			( ADDRESS OF BUFFER  )
+  ( B/BUF ) LIT 1023    ( SIZE OF BUFFER - buffer happends to be 1k in this version.. shouldnt hardcode though  XXX )
+  LIT 0 IN !		( prepare for interpret )
+  EXPECT		( get a line - expect takes target address and max size to read in )
+;
+
+( XXX this isnt used anymore, WORD does the R> DROP logic itself... easier... )
+( terminate interpetation of a line of text from terminal or other stream. fall into
+  FORTH loop and print "ok" on the terminal and wait for terminal input. )
+( ok, fig docs say that ?STACK calls this, which i find strange, and by discarding that
+  stack frame, we return to the word after INTERPRET in the FORTH loop. this is where
+  "ok" is typed at us. okeeeeeey. )
+( commented out bits relating to disc...  )
+: INTERPRET0
+  ( BLK @  ) ( examine BLK to see where input stream is from. )
+  ( 0BRANCH NULL1  )            ( IF )  ( zero means input from terminal, true means disc. )
+    ( BLK ++ 0 IN ! )                   ( get next disc buffer. )
+    ( BLK @ B/SCR 1 - AND 0= )          ( clear IN, prepare parsing of input text. )
+    ( 0BRANCH NULL2 )           ( IF )  ( there are 8 disc buffers. see if current buffer is last. )
+      ( ?EXEC )                         ( the last buffer, the end of the text block. )
+      ( R> )                            ( issue error message if not executing, discard EXECUTE's stack frame. )
+      ( DROP )                          ( i think this would cause us to return to ABORT. )
+( LABEL NULL2 )
+      ( BRANCH NULL3		( ENDIF ELSE )
+( LABEL NULL1 )                         ( input is from the terminal. )
+      R> DROP                           ( discard top of stack, like above... )
+LABEL NULL3		        ( ENDIF  )
+;*
+
+: FILL			( START COUNT VALUE -- <FILL COUNT WORDS, FROM START,
+			  WITH VALUE )
+  SWAP -DUP
+  0BRANCH FILL1
+  SWAP ROT SWAP OVER C!	( IF <NON-NULL COUNT> )
+  DUP 1+ ROT 1 -
+  CMOVE
+  BRANCH FILL2
+LABEL FILL1
+  DROP DROP
+LABEL FILL2
+;
+
+: ERASE			( START COUNT -- <ZERO OUT MEMORY> )
+  0 FILL
+;
+
+: BLANKS		( START COUNT -- <FILL WITH BLANKS> )
+  BL FILL
+;
+
+: HOLD			( C -- <PLACE C AT --HLD> )
+  HLD -- HLD @ C!
+;
+
+: PAD			( -- ADDR <OF PAD SPACE> )
+  HERE LIT 0x44 +
+;
+
+( word    c --     )
+( takes a delimiter character, and moves the word terminated by it from TIB+IN to top of memory )
+( i dont even remember where i got this version from.... )
+: WORD                     ( DELIMC )
+
+  HERE ALIGN DUP WORDSIZE + DP !      ( allocate a word for the counter )
+                           ( make sure DP is aligned... just in case we keep using a full word for the length. )
+                           ( also, keep dp's old address so we can restore it, and also len counter is there. )
+  LIT 0 OVER !             ( stack:     dp delimc .. zero out the length counter )
+  SWAP                     ( stack:     delimc dp )
+  ( HERE LIT 24 + OVER )   ( figure future here: delimc <futurehere>.. not using this )
+  HERE LIT 0x22 BLANKS     ( blank some ram:     delimc dp )
+
+  LABEL WORD2 
+    TIB @ IN @ +           ( find addy of word:  addy delimc dp )
+    C@                     (                  -- char delimc dp )
+    OVER OVER              (                  -- char delimc char delimc dp )
+    =                      ( quoting char?    -- 0/1 char delimc dp )
+    1BRANCH WORD1          (                  -- char delimc dp )
+    DUP LIT 0x0a =         ( newline char?    -- 0/1 char delimc dp )
+    1BRANCH WORD1          (                  -- char delimc dp )
+    DUP LIT 0x00 =         ( null character?  -- 0/1 char delimc dp )
+    1BRANCH WORD5          (                  -- char delimc dp ) ( if first char is null, return to QUIT loop )
+    C,                     (                  -- delimc dp )
+    IN ++                  (                  -- delimc dp )
+    OVER ++                ( increment our length counter, which is at dp )
+  BRANCH WORD2            
+
+  LABEL WORD1              ( eat up any trailing white space, and fear blanks ) 
+                           ( but first, seek past any whitespace... )
+    DROP                   ( drop the delimc. we dont care about it any more. )
+    IN ++                  (   -- dp )
+    TIB @ IN @ + C@        (   -- char dp )
+ 
+    DUP LIT 0x0a = 1BRANCH WORD1 ( -- char dp ) ( whitespace... skip over it )
+    DUP LIT 0x20 = 1BRANCH WORD1 ( -- char dp ) ( whitespace... skip over it )
+    ( DUP LIT 0x00 = 1BRANCH WORD1 ) ( -- char dp ) ( null - rig it so that we input a new line ) 
+    ( actually, ignore the null - this time. next call, well catch it right off and handle it. )
+    ( for now, we need to process what we have. )
+    BRANCH WORD4
+
+  LABEL WORD5              ( null character found - if its first character, abort back to the QUIT loop. )
+    LIT 3 PICK @           ( get dp, then fetch value at it. this is our length counter. )
+    1BRANCH WORD4          ( nope, not first character. continue processing. we will catch it next pass. )
+
+    ( fall through... )
+
+                           ( we found null - ask for more input - abort accrost several levels )
+    R> DROP                ( skip the -FIND stack frame )
+    R> DROP                ( skip the INTERPRET stack frame, return all the way back to QUIT, which prints OK and )
+                           ( runs QUERY then INTERPRET again, which finds it way back up here... )
+    ( fall through... )
+
+  LABEL WORD4
+                           ( bail out )
+    DROP DROP              ( drop char and delimc )
+    DP !                   ( not sure about this XXX restore DP to what it was - now pointing at the lenght word )
+;  
+
+: (NUMBER)
+LABEL NUM1
+  1+
+  DUP >R C@ BASE @ DIGIT
+  0BRANCH NUM2		( WHILE )
+  SWAP BASE @ * DROP   ( U* to * XXX )
+  ROT BASE @ * D+   ( U* to * XXX )
+  DPL @ 1+
+  0BRANCH NUM3
+  DPL ++		( IF )
+LABEL NUM3
+  R>			( ENDIF )
+  BRANCH NUM1		( REPEAT )
+LABEL NUM2
+  R>
+;
+
+: NUMBER
+  0 0 ROT DUP 1+ C@
+  LIT '-' = DUP >R + -1
+LABEL N1		( BEGIN )
+  DPL ! (NUMBER) DUP C@ BL !=
+  0BRANCH N2		( WHILE )
+  DUP C@ LIT '0' != 0 ?ERROR 0	( . )
+  BRANCH N1		( REPEAT )
+LABEL N2
+  DROP R>
+  0BRANCH N3		( IF )
+  DMINUS
+LABEL N3		( ENDIF )
+;
+
+( strncmp - local addition. takes len, addr1, addr2 and gives -1, 0, 1
+  to mean 1st string is lexically less then, lexically identical, and lexically greater then
+  the 2nd string. similiar to the C library function. )
+VAR STRNCMPCNT 0
+: STRNCMP
+
+  DUP 0= 0BRANCH STRNCMP0                ( check for 0-length condition )
+  DROP LIT 2 BRANCH STRNCMP7             ( if 0 length, return 2 )
+
+  LABEL STRNCMP0
+
+  STRNCMPCNT !                           ( im a wuss. we use a variable. store counter. )
+  LABEL STRNCMP1
+
+                 STRNCMPCNT @
+                 0BRANCH STRNCMP3    ( examine counter - if its 0, match! )
+                 STRNCMPCNT --       ( otherwise, deincrement it. )
+
+                 OVER C@ OVER C@ -         ( duplicate the two addresses, dereference them, subtract them )
+                 DUP 0BRANCH STRNCMP2      ( identical? loop )
+                 LIT 0 > 0BRANCH STRNCMP5  ( greather then? exit. )
+                 BRANCH STRNCMP6           ( must be less then. exit. )
+
+  LABEL STRNCMP2
+                 DROP                      ( get rid of the subtract value )
+                 1+ SWAP 1+ SWAP           ( increment addresses )
+                 BRANCH STRNCMP1
+
+  ( exit conditions )
+
+  LABEL STRNCMP5                           ( first is larger )
+                 DROP DROP                 ( get rid of the two addresses )
+                 LIT -1
+                 BRANCH STRNCMP7
+
+  LABEL STRNCMP6 
+                 DROP DROP                 ( get rid of the two addresses )
+                 LIT 1
+                 BRANCH STRNCMP7
+
+  LABEL STRNCMP3
+                 DROP DROP                 ( get rid of both addresses )
+                 LIT 0
+
+  LABEL STRNCMP7
+;
+
+
+( -FIND - accept the next word delimited by blanks in the input stream to HERE,
+  and search the CONTEXT and then the CURRENT vocabularies for a matching name.
+  if found, the entry's parameter field address, a length byte, and a true flag
+  are left on stack. otherwise, only a boolean false flag is left. )
+( this version is from C declr and doesnt use paren-FIND-paren at all )
+( other modifications: only CURRENT is searched. dont have multi vocabularies yet. )
+
+: -FIND
+
+  BL WORD                        ( move text string delimited by blanks from input to top of dictionary )
+
+  HERE WORDSIZE +                ( get top of dictionary, step to first letter in NF )
+
+  ( HERE WORDSIZE + HERE @ LIT 0x0f AND TYPE )  ( debugging... print the name of the word that we are searching for XXX )
+
+  CURRENT @                      ( NFA of last defined word - using CURRENT instead of CONTEXT )
+      
+  ( pFIND was called here - moved to Forth code. searches the dictionary starting at 
+    the address on top of the stack, looking for a name matching the text at the
+    2nd address on the stack. on success, give us PFA, len, and true flag. fail, 0 flag. )
+  LABEL -FIND1
+               OVER OVER           ( copy the two addresses )
+
+               ( DUP ID. ) ( debugging... which one are we on? )
+
+               DUP C@              ( get the length byte )
+               LIT 0x0f AND        ( and it to mask off smudge etc )
+               SWAP 1+ SWAP        ( first address, move past the length byte to start of text )
+
+                                   ( stack: length addr1 addr2 addr1 addr2 ... )
+               STRNCMP             ( strncmp wants: length addr1 addr2  strncmp gives: -1 1 on fail, 0 success )
+               0BRANCH -FIND2 
+
+                                   ( not found... try next word in dictionary )
+               NFA->LFA @          ( move to the link field, and follow the link )
+               DUP 0BRANCH -FIND9  ( if the link field is empty, weve done the whole dict and failed )
+               BRANCH -FIND1
+
+  LABEL -FIND2                     ( found! return pfa, name-len and true flag )
+               SWAP DROP           ( drop the 2nd address, which was the word at the top of the dictonary )
+               DUP C@              ( duplicate the address that matches, get the length byte )
+               LIT 0x0f AND        ( mask off smudge etc )
+               SWAP NFA->PFA SWAP  ( move from the name field to the parameter field, put len back on top of stack )
+               LIT 1               ( ok, stack should now read, from top: 1 len pfa )
+               BRANCH -FIND10      
+
+  LABEL -FIND9                     ( not found )
+               DROP DROP           ( drop the two addresses that were originally passed in )
+               LIT 0               ( return our failure )
+ 
+  LABEL -FIND10                    ( found: everything we need is already on the stack )
+;
+
+( not using this because i dont feel i should have to make <FIND> a friggin primitive )
+(
+: -FIND
+  BL WORD 
+# HERE CONTEXT @ @ <FIND> DUP 0= 0BRANCH FIND1 DROP 
+  HERE LATEST (FIND}
+  LABEL FIND1 
+;
+)
+
+: ID.			( NFA -- <PRINT ID OF A WORD > )
+  DUP @                 ( flags nfa )
+  LIT 0x0f AND          ( length nfa )
+  SWAP 1+ SWAP          ( length nfa+1 )
+  TYPE
+  SPACE
+;
+
+
+( : ID.
+  PAD LIT 0x5F BLANKS
+  DUP NFA->PFA PFA->LFA OVER - PAD SWAP CMOVE
+  PAD COUNT LIT 0x1F AND TYPE SPACE
+; )
+
+( XXX this is certain to be busted - WORD gives us a word-sized character count
+  rather then a character sized one. TOGGLE on unaligned data will bus fault
+  most processors. etc. )
+: CREATE		( MAKE A HEADER FOR THE NEXT WORD )
+  -FIND
+  0BRANCH C1
+  DROP PFA->NFA ID. LIT 4 MESSAGE SPACE	( NOT UNIQUE )
+LABEL C1
+  HERE DUP C@ WIDTH @ MIN 1+ ALLOT	( MAKE ROOM )
+  DUP LIT 0xA0 TOGGLE			( MAKE IT UNFINDABLE )
+  HERE 1 - LIT 0x80 TOGGLE		( SET HI BIT )
+  LATEST ,			( DO LF )
+  CURRENT @ !			( UPDATE FOR LATEST )
+  LIT 999 ,			( COMPILE ILLEGAL VALUE TO CODE FIELD )
+;
+
+: [COMPILE]		( COMPILE THE NEXT WORD, EVEN IF IT'S IMMEDIATE )
+  -FIND 0= 0 ?ERROR DROP PFA->CFA ,
+;*
+
+: LITERAL
+  STATE @
+  0BRANCH L1
+  COMPILE LIT 
+  ,
+LABEL L1
+;*
+
+: DLITERAL
+  STATE @
+  0BRANCH D1
+  SWAP LITERAL LITERAL
+LABEL D1
+;*
+
+: ?STACK		( error if stack overflow or underflow )
+  S0 @ SP@ < LIT 1 ?ERROR	( s0 < sp means underflow )
+  TIB @ SP@ > LIT 7 ?ERROR      ( tib >= sp means overflow )
+;
+
+( interpret sequentially execute or compiles text from the input stream depending on 
+  STATE. if the word cannot be found after searching CONTEXT and CURRENT - or just
+  CURRENT in this version - it is converted to a number according to the current
+  base. that also failing, an error message echoing the name with a " ? will be printed. )
+
+: INTERPRET
+LABEL I1
+  -FIND			( BEGIN ) ( move next word from stream to HERE and search for it )
+  0BRANCH I2            ( IF )    ( 1,lenth,pfa are on stack if found, otherwise only 0 )
+    STATE @ <		          ( are we compiling? this is a bad test. trying to test for lack of immediate bit. )
+    0BRANCH I3                  ( IF )
+      PFA->CFA ,                  ( compiling: compile code field address of found word into dictionary )
+      BRANCH I4                 ( ELSE )
+    LABEL I3
+      PFA->CFA EXECUTE            ( interpreting: figure out the code field address, and execute it )
+( this is coredumping us XXXX )
+    LABEL I4                    ( ENDIF )
+    ?STACK                        ( check for stack over/underflow condition and call ABORT if needed )
+  BRANCH I5
+  LABEL I2              ( ELSE ) ( no matching entry - try to convert it to a number )
+    HERE NUMBER                  ( HERE is start of text on top of dictionary, NUMBER takes that address )
+    DPL @ 1+                     ( and converts it to a double. any decimal points position is recorded in DPL )
+    0BRANCH I6            ( IF ) ( and if there is a decimal point, we want to compile it as a double, otherwise )
+      DLITERAL
+    BRANCH I7
+    LABEL I6              ( ELSE ) ( else we only compile it as a lit, and we drop the fractal part )
+      DROP LITERAL	
+    LABEL I7
+    ?STACK		( ENDIF ENDIF )
+  LABEL I5
+  BRANCH I1		( AGAIN )
+;
+
+: IMMEDIATE		( MAKE MOST-RECENT WORD IMMEDIATE )
+  LATEST LIT 0x40 TOGGLE
+;
+
+( *** These are commented out because we don't handle vocabularies ***
+
+: VOCABULARY
+  <BUILDS LIT 0xA081 ,
+  CURRENT @ PFA->CFA , HERE VOC-LINK @ , VOC-LINK ! DOES>
+  WORDSIZE + CONTEXT !
+;
+
+: DEFINITIONS
+  CONTEXT @ CURRENT !
+;
+*** End of commenting-out *** )
+
+( comment word - just eats up comments )
+: (
+  LIT ')'	( CLOSING PAREN )
+  WORD
+;*
+
+( quit - loop over lines of input, each time running the interpreter. things
+  return back here when we exhaust a line. WORD detects the null at the end
+  of a line, and removes all of the stack frames ahead of this one from the
+  return stack and then returns back here. )
+: QUIT
+  ( we dont do block i/o... 
+    0 BLK ! 
+  )
+  [
+LABEL Q1
+  RP! CR QUERY INTERPRET	( BEGIN )
+  STATE @ 0=
+  0BRANCH Q2
+  (.") "OK"			( IF )
+LABEL Q2
+  BRANCH Q1			( ENDIF AGAIN )
+;
+
+: ABORT
+  ( VOC-LINK @ DUP CONTEXT ! CURRENT ! )  ( from cold ) ( voc-link doesnt happen to be used )
+                                          ( current is also already initialized to a good value )
+  SP! DECIMAL ?STACK CR
+  .CPU				( PRINT THE GREETING )
+  ( FORTH )    ( we dont have vocabularies, so this isnt needed )
+  QUIT
+;
+
+: (ABORT)   ( i'm told this is this way so that users can override what happends when an error is encountered.. )
+  ABORT ;
+
+: COLD
+  ( block oriented disc i/o -- ewww!
+    FIRST USE !
+    FIRST PREV !          
+    EMPTY-BUFFERS
+  )
+  ( 1 WARNING !                    USE SCREEN 4 FOR ERROR MESSAGES )
+
+
+  ( XXX testing STRNCMP )
+  ( IP@ BRANCH COLD1
+  "Baz qux"
+  LABEL COLD1
+  WORDSIZE LIT 2 * +
+  IP@ BRANCH COLD2
+  "Baz qux"
+  LABEL COLD2
+  WORDSIZE LIT 2 * +
+  LIT 7 STRNCMP 
+  0 @ )
+
+  ABORT
+
+; 
+
+
+: S->D
+  DUP 0<
+  0BRANCH S2D1
+  -1			( HIGH WORD IS ALL 1S )
+  BRANCH S2D2
+LABEL S2D1
+  0
+LABEL S2D2
+;
+
+: +-
+  0<
+  0BRANCH PM1
+  MINUS
+LABEL PM1
+;
+
+: D+-
+  0<
+  0BRANCH DPM1
+  DMINUS
+LABEL DPM1
+;
+
+: ABS
+  DUP +-
+;
+
+: DABS
+  DUP D+-
+;
+
+: MIN
+  2DUP >
+  0BRANCH MIN1
+  SWAP
+LABEL MIN1
+  DROP
+;
+
+: MAX
+  2DUP <
+  0BRANCH MAX1
+  SWAP
+LABEL MAX1
+  DROP
+;
+
+( MATH STUFF )
+
+(
+: M*
+  2DUP XOR >R ABS SWAP ABS U* R> D+-
+;
+: M/
+  OVER >R >R DABS R ABS U/
+  R> R XOR +- SWAP
+  R> +- SWAP
+;
+: *	
+  M* DROP
+;
+: /MOD
+  >R S->D R> M/
+;
+: /		
+  /MOD SWAP DROP
+;
+: MOD
+  /MOD DROP
+;
+: */MOD
+  >R M* R> M/
+;
+: */
+  */MOD
+  SWAP DROP
+;
+)
+
+: M/MOD
+  >R 0 R / R> SWAP >R / R>  ( using / instead of U/... prolly busted... )
+;
+
+( END OF MATH STUFF )
+
+: '
+  -FIND 0= 0 ?ERROR DROP LITERAL
+;*
+
+: FORGET
+  CURRENT @ CONTEXT @ - LIT 24 ?ERROR
+  ' DUP FENCE @ < LIT 21 ?ERROR
+  DUP PFA->NFA DP ! PFA->LFA @ CONTEXT @ !
+;
+
+( COMPILING WORDS )
+
+: BACK
+  HERE - ,
+;
+
+: BEGIN
+  ?COMP HERE 1
+;*
+
+: ENDIF
+  ?COMP 2 ?PAIRS HERE OVER - SWAP !
+;*
+
+: THEN
+  ENDIF
+;*
+
+: DO
+  COMPILE (DO) HERE LIT 3
+;*
+
+: LOOP
+  LIT 3 ?PAIRS COMPILE (LOOP) BACK
+;*
+
+: +LOOP
+  LIT 3 ?PAIRS ?COMP COMPILE (+LOOP) BACK
+;*
+
+: UNTIL
+  1 ?PAIRS COMPILE 0BRANCH BACK
+;*
+
+: END
+  UNTIL
+;*
+
+: AGAIN
+  ?COMP
+  1 ?PAIRS COMPILE BRANCH BACK
+;*
+
+: REPEAT
+  ?COMP
+  >R >R AGAIN R> R> 2 -
+  ENDIF
+;*
+
+: IF
+  COMPILE 0BRANCH HERE 0 , 2
+;*
+
+: ELSE
+  2 ?PAIRS COMPILE BRANCH HERE 0 , SWAP 2 ENDIF 2
+;*
+
+: WHILE
+  IF 2+
+;*
+
+: SPACES
+  LIT 0 MAX -DUP 0BRANCH SPACES1
+  LIT 0 (DO) 
+LABEL SPACES2
+  	SPACE 
+  (LOOP) SPACES2
+LABEL SPACES1
+;
+
+: <#
+  PAD HLD !
+;
+
+: #>
+  DROP DROP HLD @ PAD OVER -
+;
+
+: SIGN
+  ROT 0< 0BRANCH SIGN1
+  LIT '-'  HOLD
+LABEL SIGN1
+;
+
+: #
+  BASE @ M/MOD ROT LIT 9 OVER < 0BRANCH #1
+  LIT 7 +		( 7 is offset to make 'A' come after '9' )
+LABEL #1
+  LIT '0' + HOLD
+;
+
+: #S
+LABEL #S1
+  # 2DUP OR 0= 0BRANCH #S1
+;
+
+: D.R
+  >R SWAP OVER DABS <# #S SIGN #> R> OVER - SPACES TYPE
+;
+
+: .R
+  >R S->D R> D.R
+;
+
+: D.
+  0 D.R SPACE
+;
+
+: .
+  S->D D.
+;
+
+: ?
+  @ .
+;
+
+: U.
+  0 D.
+;
+
+: VLIST
+  C/L 1+ OUT !  CONTEXT @ @
+LABEL VLIST1			( BEGIN )
+  OUT @ C/L > 0BRANCH VLIST2	( IF )
+  CR
+LABEL VLIST2			( THEN )
+  DUP ID. SPACE NFA->PFA PFA->LFA @
+  DUP 0= ?TERMINAL OR 0BRANCH VLIST1	( UNTIL )
+  DROP
+;
+
+: .CPU
+  (.") "Forth Construction Set/C coded Forth"	( special string handling )
+;
+
+: BYE
+  CR (.") "EXIT FORTH" CR
+  0 (BYE)
+;
+
+(    this is disc related, so it gets the axe
+: LIST
+  DECIMAL CR
+  DUP SCR ! (."} "SCR # " .
+  LIT 16 0 (DO}
+LABEL LIST1
+    CR I 3 .R SPACE
+    I SCR @ .LINE
+    ?TERMINAL 0BRANCH LIST2
+      LEAVE
+LABEL LIST2
+  (LOOP} LIST1
+  CR
+;
+)  
+
+: CASE
+  ?COMP CSP @ !CSP LIT 4
+;*
+
+: OF
+  ?COMP LIT 4 ?PAIRS
+  COMPILE OVER COMPILE = COMPILE 0BRANCH 
+  HERE 0 ,
+  COMPILE DROP
+  LIT 5
+;*
+
+: ENDOF
+  ?COMP
+  LIT 5 ?PAIRS
+  COMPILE BRANCH
+  HERE 0 ,
+  SWAP 2 ENDIF LIT 4
+;*
+
+: ENDCASE
+  ?COMP
+  LIT 4 ?PAIRS
+  COMPILE DROP
+LABEL ENDC1			( BEGIN )
+  SP@ CSP @ != 0BRANCH ENDC2	( WHILE )
+  2 ENDIF
+  BRANCH ENDC1			( REPEAT )
+LABEL ENDC2
+  CSP !
+;*
+
+: \			( REMAINER OF THE LINE IS A COMMENT )
+  ( ?LOADING  this would check to see if we were "loading screens" and issue error message 16 if not )
+  IN @ C/L / 1+ C/L * IN !
+;*
+
+: ALIAS		( usage: ALIAS NEW OLD; makes already-compiled references )
+		( to OLD refer to NEW. Restrictions: OLD must have been a )
+		( colon-definition, and it must not have been of the form )
+		( ' : OLD ; ' where the first word of the PFA is ;S .     )
+  ' PFA->CFA
+  ' DUP
+  2 - @ LIT DOCOL != LIT 27 ?ERROR	( ERROR IF NOT A COLON DEFINITION )
+  DUP @	LIT ;S = LIT 28 ?ERROR		( MAKE SURE ;S IS NOT THE FIRST WORD )
+  DUP >R ! LIT ;S R> 2+ !
+;
+
+: REFORTH		( GET & EXECUTE ONE FORTH LINE <PERHAPS A NUMBER> )
+  IN @ >R BLK @ >R
+  0 IN ! 0 BLK !
+  QUERY INTERPRET
+  R> BLK ! R> IN !
+;
+
+( jury-rigged this one... )
+: MESSAGE
+                 OVER LIT 4 <> 0BRANCH MESSAGE1
+                 (.") "Not Unique Error" BRANCH MESSAGE9
+  LABEL MESSAGE1 OVER LIT 1 <> 0BRANCH MESSAGE2
+                 (.") "Other Random Error" BRANCH MESSAGE9
+  LABEL MESSAGE2 OVER LIT 17 <> 0BRANCH MESSAGE3
+                 (.") "Not Compiling" BRANCH MESSAGE9
+  LABEL MESSAGE3 OVER LIT 18 <> 0BRANCH MESSAGE4
+                 (.") "Not Executing" BRANCH MESSAGE9
+  LABEL MESSAGE4 OVER LIT 19 <> 0BRANCH MESSAGE5
+                 (.") "Pairs Don't Match" BRANCH MESSAGE9
+  LABEL MESSAGE5 OVER LIT 20 <> 0BRANCH MESSAGE8
+                 (.") "CSP and SP don't match" BRANCH MESSAGE9
+  LABEL MESSAGE8 (.") "Unknown Error Message" BRANCH MESSAGE9
+  LABEL MESSAGE9
+;
+
+( end of words from the original c-forth dictionary )
+( start of words from atari xe antic 6502 antic forth )
+
+VAR TO-FLAG 0
+
+(
+CODE TO
+  LDA #1
+  STA TO-FLAG
+  JMP NEXT
+  C;
+)
+
+(
+: VAR
+  CONSTANT  
+  ;CODE
+    LDA TO-FLAG 
+    0= IF
+    LDY #2
+    W }Y STA
+    JMP PUSH
+    ELSE
+    LDA #0
+    STA TO-FLAG
+    LDA 0,X
+    INY
+    STA W }Y
+    JMP 0E5D
+    THEN
+    C;
+  : VALUE 0 VAR ;
+;S
+)
+
+( word i shamelessly created and inserted )
+
+: (WHITESPACE)
+  ( to aid in reconstructing code from dissasembly, we store whitespace info )
+  ( ok, i gotta figure this out and simplify it. only need to skip over the string, not print it. )
+  R COUNT
+  DUP 1+ R> + >R  ( TYPE   ) DROP DROP
+; 
+
+( trace - keep picking off the next cfa from the instruction stream, and excute it. )
+( this isnt going to work unless we trap and handle branches, lits, strings, etc etc etc )
+( follow instructions untill we find a 'trace-off' instruction. )
+( we store our current pointer into the word that called us in trace-ip )
+( so that the words we call have full run of the computation stack and return stack. )
+( this makes us non reenterent, so we must make sure we aren't running before we start. )
+VAR trace-ip 0
+: trace                    ( stack: -- )
+        R>                 ( stack: returnaddr -- )
+        DUP                ( stack: returnaddr returnaddr -- )
+  LABEL TRACE1             
+        trace-ip !         ( stack: returnaddr returnaddr ???... -- returnaddr ???... )
+        @                  ( stack: returnaddr ???... --- cfa ???... )
+
+        DUP COMPILE (.") = BRANCH TRACE3    ( skip over inline strings... )
+        DUP COMPILE (COMMENT) = BRANCH TRACE3
+        DUP COMPILE LIT = BRANCH TRACE4     ( skip over inline word... )
+
+
+        EXECUTE            ( stack: ???... -- ???... )
+        trace-ip @         ( stack: ???... -- returnaddr ???... )
+        DUP 0BRANCH TRACE2 ( if trace-off has been zero'd, pack up and go home )
+        WORDSIZE +         ( stack: returnaddr ???... -- new-returnaddr ???... )
+  LABEL TRACE5             ( return from skipping an inline string or lit )
+        DUP                ( stack: new-returnaddr ???... --- new-returnaddr new-returnaddr ???... )
+        trace-ip !         ( stack: ???... -- )
+        BRANCH TRACE1      
+
+  LABEL TRACE3             ( skip over an inline string )
+
+  LABEL TRACE4             ( skip over an inline word )
+
+  LABEL TRACE2             ( pack up and go home )
+        DROP               ( returnaddr/0 ???... --- ???... )
+;
+: trace-off
+  0 trace-ip !
+;
+
+(
+
+  ?COMP
+  R> DUP		 GET OUR RETURN ADDRESS 
+  WORDSIZE + >R		 SKIP NEXT; ORIG. ADDR STILL ON TOS 
+  @ ,
+)
+
+( The vocabulary word FORTH will be compiled after the dictionary is read,
+  with a pointer to the last word in the dictionary, which will be itself. )
+
